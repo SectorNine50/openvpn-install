@@ -131,15 +131,16 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 			read -p "Do you really want to remove OpenVPN? [y/n]: " -e -i n REMOVE
 			if [[ "$REMOVE" = 'y' ]]; then
 				PORT=$(grep '^port ' /etc/openvpn/server.conf | cut -d " " -f 2)
+				PROTOCOL=$(grep '^proto ' /etc/openvpn/server.conf | cut -d " " -f 2)
 				if pgrep firewalld; then
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
-					firewall-cmd --zone=public --remove-port=$PORT/udp
+					firewall-cmd --zone=public --remove-port=$PORT/$PROTOCOL
 					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --permanent --zone=public --remove-port=$PORT/udp
+					firewall-cmd --permanent --zone=public --remove-port=$PORT/$PROTOCOL
 					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
 				fi
 				if iptables -L -n | grep -qE 'REJECT|DROP'; then
-					sed -i "/iptables -I INPUT -p udp --dport $PORT -j ACCEPT/d" $RCLOCAL
+					sed -i "/iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
 					sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
 					sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
 				fi
@@ -147,7 +148,7 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 				if hash sestatus 2>/dev/null; then
 					if sestatus | grep "Current mode" | grep -qs "enforcing"; then
 						if [[ "$PORT" != '1194' ]]; then
-							semanage port -d -t openvpn_port_t -p udp $PORT
+							semanage port -d -t openvpn_port_t -p $PROTOCOL $PORT
 						fi
 					fi
 				fi
@@ -184,14 +185,14 @@ else
 	echo "What port do you want for OpenVPN?"
 	read -p "Port: " -e -i 1194 PORT
 	echo ""
-	echo "What DNS do you want to use with the VPN?"
-	echo "   1) Current system resolvers"
-	echo "   2) Google"
-	echo "   3) OpenDNS"
-	echo "   4) NTT"
-	echo "   5) Hurricane Electric"
-	echo "   6) Verisign"
-	read -p "DNS [1-6]: " -e -i 1 DNS
+	echo "What protocol do you want to use for OpenVPN (udp/tcp)?"
+	read -p "Protocol: " -e -i udp PROTOCOL
+	echo ""
+	echo "What subnet do you want to route traffic to?"
+	read -p "Subnet: " -e SUBNET
+	echo ""
+	echo "What is the netmask of the subnet you want to route traffic to?"
+	read -p "Netmask: " -e -i 255.255.255.0 MASK
 	echo ""
 	echo "Finally, tell me your name for the client cert"
 	echo "Please, use one word only, no special characters"
@@ -234,7 +235,7 @@ else
 	openvpn --genkey --secret /etc/openvpn/ta.key
 	# Generate server.conf
 	echo "port $PORT
-proto udp
+proto $PROTOCOL
 dev tun
 sndbuf 0
 rcvbuf 0
@@ -246,35 +247,7 @@ tls-auth ta.key 0
 topology subnet
 server 10.8.0.0 255.255.255.0
 ifconfig-pool-persist ipp.txt" > /etc/openvpn/server.conf
-	echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server.conf
-	# DNS
-	case $DNS in
-		1) 
-		# Obtain the resolvers from resolv.conf and use them for OpenVPN
-		grep -v '#' /etc/resolv.conf | grep 'nameserver' | grep -E -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | while read line; do
-			echo "push \"dhcp-option DNS $line\"" >> /etc/openvpn/server.conf
-		done
-		;;
-		2) 
-		echo 'push "dhcp-option DNS 8.8.8.8"' >> /etc/openvpn/server.conf
-		echo 'push "dhcp-option DNS 8.8.4.4"' >> /etc/openvpn/server.conf
-		;;
-		3)
-		echo 'push "dhcp-option DNS 208.67.222.222"' >> /etc/openvpn/server.conf
-		echo 'push "dhcp-option DNS 208.67.220.220"' >> /etc/openvpn/server.conf
-		;;
-		4) 
-		echo 'push "dhcp-option DNS 129.250.35.250"' >> /etc/openvpn/server.conf
-		echo 'push "dhcp-option DNS 129.250.35.251"' >> /etc/openvpn/server.conf
-		;;
-		5) 
-		echo 'push "dhcp-option DNS 74.82.42.42"' >> /etc/openvpn/server.conf
-		;;
-		6) 
-		echo 'push "dhcp-option DNS 64.6.64.6"' >> /etc/openvpn/server.conf
-		echo 'push "dhcp-option DNS 64.6.65.6"' >> /etc/openvpn/server.conf
-		;;
-	esac
+	echo "push \"route $SUBNET $MASK\"" >> /etc/openvpn/server.conf
 	echo "keepalive 10 120
 cipher AES-256-CBC
 comp-lzo
@@ -299,19 +272,19 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 		# We don't use --add-service=openvpn because that would only work with
 		# the default port. Using both permanent and not permanent rules to
 		# avoid a firewalld reload.
-		firewall-cmd --zone=public --add-port=$PORT/udp
+		firewall-cmd --zone=public --add-port=$PORT/$PROTOCOL
 		firewall-cmd --zone=trusted --add-source=10.8.0.0/24
-		firewall-cmd --permanent --zone=public --add-port=$PORT/udp
+		firewall-cmd --permanent --zone=public --add-port=$PORT/$PROTOCOL
 		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
 	fi
 	if iptables -L -n | grep -qE 'REJECT|DROP'; then
 		# If iptables has at least one REJECT rule, we asume this is needed.
 		# Not the best approach but I can't think of other and this shouldn't
 		# cause problems.
-		iptables -I INPUT -p udp --dport $PORT -j ACCEPT
+		iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
 		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
 		iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-		sed -i "1 a\iptables -I INPUT -p udp --dport $PORT -j ACCEPT" $RCLOCAL
+		sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
 		sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
 		sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
 	fi
@@ -323,7 +296,7 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 				if ! hash semanage 2>/dev/null; then
 					yum install policycoreutils-python -y
 				fi
-				semanage port -a -t openvpn_port_t -p udp $PORT
+				semanage port -a -t openvpn_port_t -p $PROTOCOL $PORT
 			fi
 		fi
 	fi
@@ -360,7 +333,7 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 	# client-common.txt is created so we have a template to add further users later
 	echo "client
 dev tun
-proto udp
+proto $PROTOCOL
 sndbuf 0
 rcvbuf 0
 remote $IP $PORT
